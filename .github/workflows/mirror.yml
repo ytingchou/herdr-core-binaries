@@ -62,7 +62,7 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/herdrdev/herdr-core/master/LICENSE -o "$tmp/LICENSE"
           "$tmp/bin/linux-x86_64/herdr-core" --version | grep -Fx "hc $version"
           if cmp -s "$tmp/manifest.json" upstream-manifest.json; then
-            snapshot=$(git log -1 --format=%H -- upstream-manifest.json)
+            echo "Binaries for $version are already on main"
           else
             rm -rf bin
             mv "$tmp/bin" bin
@@ -71,12 +71,16 @@ jobs:
             printf '%s\n' "$version" > VERSION
             git add -- bin upstream-manifest.json LICENSE VERSION
             git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Mirror Herdr Core $version"
-            snapshot=$(git rev-parse HEAD)
           fi
 
+          # A release tag carries the binaries and metadata, with no Actions workflows.
+          tree=$(git ls-tree HEAD -- bin LICENSE VERSION upstream-manifest.json | git mktree)
           if git show-ref --verify --quiet "refs/tags/$tag"; then
-            test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$snapshot"
+            test "$(git rev-parse "refs/tags/$tag^{tree}")" = "$tree"
           else
+            snapshot=$(git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit-tree "$tree" -m "Herdr Core $tag release snapshot")
             git tag "$tag" "$snapshot"
           fi
           git push --atomic origin HEAD:main "refs/tags/$tag"
