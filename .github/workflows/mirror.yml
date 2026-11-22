@@ -20,7 +20,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: main
-      - name: Verify and commit official binaries
+          fetch-depth: 0
+      - name: Mirror and publish verified binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           tmp=$(mktemp -d)
@@ -28,10 +31,14 @@ jobs:
           origin=https://releases.herdr.dev/core
           curl --fail --silent --show-error --location --retry 3 "$origin/latest.json" -o "$tmp/manifest.json"
           version=$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' "$tmp/manifest.json")
-          if cmp -s "$tmp/manifest.json" upstream-manifest.json; then
-            echo "Already mirrored $version"
+          tag="v$version"
+          release=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+            jq -cs --arg tag "$tag" '[.[][] | select(.tag_name == $tag)][0] // {}')
+          if [[ "$(jq -r '.draft' <<< "$release")" == false ]]; then
+            echo "$tag is already published"
             exit 0
           fi
+          assets=()
           for target in linux-x86_64 linux-aarch64 windows-x86_64; do
             extension=tar.gz
             if [[ "$target" == windows-* ]]; then extension=zip; fi
@@ -41,6 +48,7 @@ jobs:
             [[ "$url" == "$origin/$version/$asset" ]]
             curl --fail --silent --show-error --location --retry 3 "$url" -o "$tmp/$asset"
             printf '%s  %s\n' "$digest" "$tmp/$asset" | sha256sum --check
+            assets+=("$tmp/$asset")
             dest="$tmp/bin/$target"
             mkdir -p "$dest"
             if [[ "$extension" == zip ]]; then
@@ -53,11 +61,36 @@ jobs:
           done
           curl --fail --silent --show-error --location --retry 3 https://raw.githubusercontent.com/herdrdev/herdr-core/master/LICENSE -o "$tmp/LICENSE"
           "$tmp/bin/linux-x86_64/herdr-core" --version | grep -Fx "hc $version"
-          rm -rf bin
-          mv "$tmp/bin" bin
-          cp "$tmp/manifest.json" upstream-manifest.json
-          cp "$tmp/LICENSE" LICENSE
-          printf '%s\n' "$version" > VERSION
-          git add -- bin upstream-manifest.json LICENSE VERSION
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Mirror Herdr Core $version"
-          git push origin HEAD:main
+          if cmp -s "$tmp/manifest.json" upstream-manifest.json; then
+            snapshot=$(git log -1 --format=%H -- upstream-manifest.json)
+          else
+            rm -rf bin
+            mv "$tmp/bin" bin
+            cp "$tmp/manifest.json" upstream-manifest.json
+            cp "$tmp/LICENSE" LICENSE
+            printf '%s\n' "$version" > VERSION
+            git add -- bin upstream-manifest.json LICENSE VERSION
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "Mirror Herdr Core $version"
+            snapshot=$(git rev-parse HEAD)
+          fi
+
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$snapshot"
+          else
+            git tag "$tag" "$snapshot"
+          fi
+          git push --atomic origin HEAD:main "refs/tags/$tag"
+
+          if [[ "$(jq -r '.id // empty' <<< "$release")" == "" ]]; then
+            gh release create "$tag" --draft --verify-tag --title "Herdr Core $tag" \
+              --notes "Official Herdr Core archives, verified against upstream SHA-256 checksums. Tagged source includes extracted binaries."
+          fi
+          for asset in "${assets[@]}"; do
+            basename=$(basename "$asset")
+            digest=$(sha256sum "$asset" | cut -d ' ' -f 1)
+            existing=$(jq -r --arg name "$basename" '.assets[]? | select(.name == $name) | .digest' <<< "$release")
+            if [[ "$existing" != "sha256:$digest" ]]; then
+              gh release upload "$tag" "$asset" --clobber
+            fi
+          done
+          gh release edit "$tag" --draft=false
